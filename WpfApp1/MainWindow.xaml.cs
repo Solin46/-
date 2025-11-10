@@ -1,5 +1,6 @@
 ﻿using System;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.IO;
 using System.Linq;
 using System.Windows;
@@ -15,58 +16,70 @@ namespace VectorEditor
     {
         #region Переменные и константы
 
-        private enum ToolMode { Select, Rectangle, Ellipse, Line, Polygon }
-        private enum EditorMode { Drawing, Editing }
+        private enum ToolMode {Rectangle, Ellipse, Line, Polygon }
+        private enum EditorMode { Creating, Editing }
 
         private ToolMode currentTool = ToolMode.Rectangle;
-        private EditorMode currentMode = EditorMode.Drawing;
+        private EditorMode currentMode = EditorMode.Creating;
 
         private Shape currentShape;
         private Point startPoint;
-        private bool isDrawing = false;
+        private bool isCreating = false;
         private bool isMoving = false;
+        private bool isScaling = false;
         private Point moveStartPoint;
+        private Point scaleStartPoint;
         private Shape selectedShape;
 
-        private Color fillColor = Colors.LightBlue;
-        private Color strokeColor = Colors.Black;
+        private Color fillColor = Colors.LightGray;
+        private Color strokeColor = Colors.LightGray;
         private double strokeThickness = 2;
 
-        private Stack<EditorAction> undoStack = new Stack<EditorAction>();
-        private Stack<Shape> deletedShapes = new Stack<Shape>();
-        private const int MAX_UNDO_STEPS = 5;
+        private Queue<EditorAction> undoQueue = new Queue<EditorAction>();
+        private const int MAX_UNDO_STEPS = 10;
 
         private List<Point> polygonPoints = new List<Point>();
-        private bool isDrawingPolygon = false;
+        private bool isCreatingPolygon = false;
 
+        private bool wasActuallyMoved = false;
+
+        private List<Rectangle> resizeHandles = new List<Rectangle>();
+        private ShapePosition initialPosition;
+
+        // Ограничения масштабирования
+        private const double MIN_SCALE = 0.3;
+        private const double MAX_SCALE = 3.0;
         // Предустановленные цвета
         private readonly (string Name, Color Color)[] fillColors = new[]
         {
-            ("Красный", Colors.Red),
+            ("Белый", Colors.White),
+            ("Серый", Colors.Gray),
+            ("Черный", Colors.Black),
+            ("Фиолетовый", Colors.Purple),
             ("Синий", Colors.Blue),
+            ("Голубой", Colors.LightBlue),
             ("Зеленый", Colors.Green),
+            ("Салатовый", Colors.LightGreen),
             ("Желтый", Colors.Yellow),
             ("Оранжевый", Colors.Orange),
-            ("Фиолетовый", Colors.Purple),
-            ("Розовый", Colors.Pink),
-            ("Голубой", Colors.LightBlue),
-            ("Салатовый", Colors.LightGreen),
-            ("Белый", Colors.White),
-            ("Черный", Colors.Black),
-            ("Серый", Colors.Gray)
+            ("Красный", Colors.Red),
+            ("Розовый", Colors.Pink)
         };
 
         private readonly (string Name, Color Color)[] strokeColors = new[]
         {
-            ("Черный", Colors.Black),
-            ("Красный", Colors.Red),
-            ("Синий", Colors.Blue),
-            ("Зеленый", Colors.Green),
             ("Фиолетовый", Colors.Purple),
+            ("Синий", Colors.Blue),
+            ("Голубой", Colors.LightBlue),
+            ("Зеленый", Colors.Green),
+            ("Салатовый", Colors.LightGreen),
+            ("Желтый", Colors.Yellow),
             ("Оранжевый", Colors.Orange),
-            ("Белый", Colors.White),
+            ("Красный", Colors.Red),
+            ("Коричневый", Colors.Brown),
+            ("Черный", Colors.Black),
             ("Серый", Colors.Gray),
-            ("Коричневый", Colors.Brown)
+            ("Белый", Colors.White)
         };
 
         #endregion
@@ -80,6 +93,16 @@ namespace VectorEditor
             public object OldValue { get; set; }
             public object NewValue { get; set; }
             public string PropertyName { get; set; }
+            public ShapePosition FullState { get; set; } // Полное состояние фигуры при удалении
+        }
+
+        public class ShapePosition
+        {
+            public double X { get; set; }
+            public double Y { get; set; }
+            public double Width { get; set; }
+            public double Height { get; set; }
+            public List<Point> Points { get; set; }
         }
 
         #endregion
@@ -96,7 +119,6 @@ namespace VectorEditor
         {
             try
             {
-                // Устанавливаем начальные значения
                 shapeComboBox.SelectedIndex = 0;
                 zoomSlider.Value = 1.0;
                 if (zoomText != null)
@@ -104,7 +126,6 @@ namespace VectorEditor
 
                 UpdateColorButtons();
 
-                // Подписываемся на события
                 shapeComboBox.SelectionChanged += ShapeComboBox_SelectionChanged;
                 zoomSlider.ValueChanged += ZoomSlider_ValueChanged;
                 drawModeRadio.Checked += DrawModeRadio_Checked;
@@ -153,17 +174,15 @@ namespace VectorEditor
 
         private void DrawModeRadio_Checked(object sender, RoutedEventArgs e)
         {
-            currentMode = EditorMode.Drawing;
+            currentMode = EditorMode.Creating;
             DeselectShape();
             UpdateColorButtons();
-            System.Diagnostics.Debug.WriteLine("🆕 Режим: Создание (создание новых фигур)");
         }
 
         private void EditModeRadio_Checked(object sender, RoutedEventArgs e)
         {
             currentMode = EditorMode.Editing;
             UpdateColorButtons();
-            System.Diagnostics.Debug.WriteLine("🔧 Режим: Редактирование (изменение существующих фигур)");
         }
 
         private void ShapeComboBox_SelectionChanged(object sender, SelectionChangedEventArgs e)
@@ -176,7 +195,7 @@ namespace VectorEditor
 
         #endregion
 
-        #region Масштабирование
+        #region Масштабирование холста
 
         private void ZoomInButton_Click(object sender, RoutedEventArgs e)
         {
@@ -227,13 +246,22 @@ namespace VectorEditor
 
             if (currentMode == EditorMode.Editing)
             {
-                // режим редактирования: изменение цвета и перемещение
                 var element = mainCanvas.InputHitTest(position) as FrameworkElement;
+                if (element is Rectangle handle && resizeHandles.Contains(handle))
+                {
+                    isScaling = true;
+                    scaleStartPoint = position;
+                    SaveInitialPosition(selectedShape);
+                    e.Handled = true;
+                    return;
+                }
+
                 if (element is Shape shape)
                 {
                     SelectShape(shape);
                     isMoving = true;
                     moveStartPoint = position;
+                    SaveInitialPosition(shape);
                 }
                 else
                 {
@@ -242,17 +270,16 @@ namespace VectorEditor
             }
             else
             {
-                // режим создания: создание новых фигур
                 if (currentTool == ToolMode.Polygon)
                 {
-                    if (e.ClickCount == 2) // Двойной клик для завершения
+                    if (e.ClickCount == 2)
                     {
                         CompletePolygon();
                         e.Handled = true;
                     }
                     else if (e.LeftButton == MouseButtonState.Pressed)
                     {
-                        if (!isDrawingPolygon)
+                        if (!isCreatingPolygon)
                         {
                             StartPolygon(position);
                         }
@@ -266,7 +293,7 @@ namespace VectorEditor
                 else
                 {
                     DeselectShape();
-                    StartDrawingShape(position);
+                    StartCreatingShape(position);
                 }
             }
         }
@@ -277,44 +304,19 @@ namespace VectorEditor
 
             if (isMoving && selectedShape != null)
             {
-                // Перемещение фигуры
-                double deltaX = position.X - moveStartPoint.X;
-                double deltaY = position.Y - moveStartPoint.Y;
-
-                if (selectedShape is Line line)
+                if (!wasActuallyMoved)
                 {
-                    // особая логика для линии
-                    line.X1 += deltaX;
-                    line.Y1 += deltaY;
-                    line.X2 += deltaX;
-                    line.Y2 += deltaY;
-                }
-                else if (selectedShape is Polygon polygon)
-                {
-                    // особая логика для многоугольника
-                    var newPoints = new PointCollection();
-                    foreach (Point point in polygon.Points)
-                    {
-                        newPoints.Add(new Point(point.X + deltaX, point.Y + deltaY));
-                    }
-                    polygon.Points = newPoints;
-                }
-                else
-                {
-                    // логика для других фигур
-                    double currentLeft = Canvas.GetLeft(selectedShape);
-                    double currentTop = Canvas.GetTop(selectedShape);
-
-                    if (!double.IsNaN(currentLeft) && !double.IsNaN(currentTop))
-                    {
-                        Canvas.SetLeft(selectedShape, currentLeft + deltaX);
-                        Canvas.SetTop(selectedShape, currentTop + deltaY);
-                    }
+                    SaveInitialPosition(selectedShape);
+                    wasActuallyMoved = true;
                 }
 
-                moveStartPoint = position;
+                MoveShape(position);
             }
-            else if (isDrawing && currentShape != null && currentTool != ToolMode.Polygon)
+            else if (isScaling && selectedShape != null)
+            {
+                ScaleShape(position);
+            }
+            else if (isCreating && currentShape != null && currentTool != ToolMode.Polygon)
             {
                 UpdateShapeSize(position);
             }
@@ -322,16 +324,28 @@ namespace VectorEditor
 
         private void MainCanvas_MouseUp(object sender, MouseButtonEventArgs e)
         {
-            if (isDrawing && currentTool != ToolMode.Polygon)
+            if (isCreating && currentTool != ToolMode.Polygon)
             {
-                FinishDrawingShape();
+                FinishCreatingShape();
             }
             else if (isMoving)
             {
                 isMoving = false;
+
+                if (wasActuallyMoved && selectedShape != null)
+                {
+                    SaveFinalPosition("Move", selectedShape);
+                }
+
+                wasActuallyMoved = false;
+                moveStartPoint = default(Point);
+            }
+            else if (isScaling)
+            {
+                isScaling = false;
                 if (selectedShape != null)
                 {
-                    SaveAction("Move", selectedShape);
+                    SaveFinalPosition("Scale", selectedShape);
                 }
             }
         }
@@ -340,9 +354,9 @@ namespace VectorEditor
 
         #region Создание фигур
 
-        private void StartDrawingShape(Point position)
+        private void StartCreatingShape(Point position)
         {
-            isDrawing = true;
+            isCreating = true;
             startPoint = position;
 
             switch (currentTool)
@@ -382,10 +396,13 @@ namespace VectorEditor
                 Canvas.SetTop(currentShape, position.Y);
                 currentShape.Width = 0;
                 currentShape.Height = 0;
+
+                currentShape.MouseDown += Shape_MouseDown;
                 mainCanvas.Children.Add(currentShape);
             }
             else if (currentTool == ToolMode.Line)
             {
+                currentShape.MouseDown += Shape_MouseDown;
                 mainCanvas.Children.Add(currentShape);
             }
         }
@@ -418,15 +435,16 @@ namespace VectorEditor
             }
         }
 
-        private void FinishDrawingShape()
+        private void FinishCreatingShape()
         {
-            isDrawing = false;
+            isCreating = false;
             if (currentShape != null)
             {
                 if ((currentShape.Width > 1 || currentShape.Height > 1) || currentTool == ToolMode.Line)
                 {
                     SelectShape(currentShape);
-                    SaveAction("Create", currentShape);
+                    var fullState = GetFullShapeState(currentShape);
+                    SaveAction("Create", currentShape, null, null, null, fullState);
                 }
                 else
                 {
@@ -438,7 +456,7 @@ namespace VectorEditor
 
         private void StartPolygon(Point position)
         {
-            isDrawingPolygon = true;
+            isCreatingPolygon = true;
             polygonPoints.Clear();
             polygonPoints.Add(position);
 
@@ -446,7 +464,7 @@ namespace VectorEditor
             {
                 Stroke = new SolidColorBrush(strokeColor),
                 StrokeThickness = strokeThickness,
-                StrokeDashArray = new DoubleCollection() { 4, 2 } // Пунктирная линия для preview
+                StrokeDashArray = new DoubleCollection() { 4, 2 }
             };
             currentShape.SetValue(Polyline.PointsProperty, new PointCollection(polygonPoints));
             mainCanvas.Children.Add(currentShape);
@@ -454,10 +472,8 @@ namespace VectorEditor
 
         private void AddPolygonPoint(Point position)
         {
-            // Проверяем, не пересекается ли новая линия с существующими
             if (polygonPoints.Count >= 2 && LinesIntersect(polygonPoints, position))
             {
-                // Если линии пересекаются, завершаем многоугольник
                 CompletePolygon();
             }
             else
@@ -474,7 +490,6 @@ namespace VectorEditor
         {
             if (mainCanvas == null || polygonPoints.Count < 3) return;
 
-            // Автоматически замыкаем многоугольник, добавляя первую точку в конец
             if (polygonPoints.Count > 2 && polygonPoints[0] != polygonPoints[polygonPoints.Count - 1])
             {
                 polygonPoints.Add(polygonPoints[0]);
@@ -488,29 +503,25 @@ namespace VectorEditor
             };
             polygon.Points = new PointCollection(polygonPoints);
 
-            // Удаляем временную полилинию и добавляем готовый многоугольник
             mainCanvas.Children.Remove(currentShape);
             mainCanvas.Children.Add(polygon);
 
-            // Добавляем обработчики для перемещения и удаления
             polygon.MouseDown += Shape_MouseDown;
-            polygon.MouseMove += Shape_MouseMove;
-            polygon.MouseUp += Shape_MouseUp;
-
+            
             SelectShape(polygon);
-            SaveAction("Create", polygon);
 
-            isDrawingPolygon = false;
+            var fullState = GetFullShapeState(polygon);
+            SaveAction("Create", polygon, null, null, null, fullState);
+
+            isCreatingPolygon = false;
             polygonPoints.Clear();
             currentShape = null;
         }
 
-        // Метод для проверки пересечения линий
         private bool LinesIntersect(List<Point> points, Point newPoint)
         {
             if (points.Count < 2) return false;
 
-            // Создаем новую линию от последней точки к новой
             Line newLine = new Line
             {
                 X1 = points[points.Count - 1].X,
@@ -519,7 +530,6 @@ namespace VectorEditor
                 Y2 = newPoint.Y
             };
 
-            // Проверяем пересечение новой линии со всеми существующими линиями (кроме смежных)
             for (int i = 0; i < points.Count - 2; i++)
             {
                 Line existingLine = new Line
@@ -539,7 +549,6 @@ namespace VectorEditor
             return false;
         }
 
-        // Метод для определения пересечения двух отрезков
         private bool DoLinesIntersect(Line line1, Line line2)
         {
             double x1 = line1.X1, y1 = line1.Y1;
@@ -547,25 +556,24 @@ namespace VectorEditor
             double x3 = line2.X1, y3 = line2.Y1;
             double x4 = line2.X2, y4 = line2.Y2;
 
-            // Вычисляем ориентированные площади треугольников
             double det = (x2 - x1) * (y4 - y3) - (x4 - x3) * (y2 - y1);
-            if (det == 0) return false; // Линии параллельны
+            if (det == 0) return false;
 
             double t = ((x3 - x1) * (y4 - y3) - (x4 - x3) * (y3 - y1)) / det;
             double u = -((x3 - x1) * (y2 - y1) - (x2 - x1) * (y3 - y1)) / det;
 
-            // Проверяем, что точка пересечения находится на обоих отрезках
             return (t >= 0 && t <= 1 && u >= 0 && u <= 1);
         }
 
         #endregion
 
-        #region Выделение фигур
+        #region Выделение и управление фигурами
 
         private void SelectShape(Shape shape)
         {
             DeselectShape();
             selectedShape = shape;
+            ShowResizeHandles(shape);
             UpdateColorButtons();
         }
 
@@ -573,126 +581,546 @@ namespace VectorEditor
         {
             if (selectedShape != null)
             {
+                HideResizeHandles();
                 selectedShape = null;
                 UpdateColorButtons();
             }
         }
 
-        // Обработчики событий для фигур
         private void Shape_MouseDown(object sender, MouseButtonEventArgs e)
         {
             if (currentMode == EditorMode.Editing && sender is Shape shape)
             {
                 SelectShape(shape);
-                isMoving = true;
-                moveStartPoint = e.GetPosition(mainCanvas);
+                if (e.LeftButton == MouseButtonState.Pressed)
+                {
+                    isMoving = true;
+                    moveStartPoint = e.GetPosition(mainCanvas);
+                }
+
                 e.Handled = true;
             }
         }
 
-        private void Shape_MouseMove(object sender, MouseEventArgs e)
+        #endregion
+
+        #region Масштабирование фигур
+
+        private void ShowResizeHandles(Shape shape) //показывает маркеры масштабирования
         {
-            // Логика перемещения обрабатывается в MainCanvas_MouseMove
+            HideResizeHandles();
+
+            Rect bounds = GetShapeBounds(shape);
+
+            for (int i = 0; i < 8; i++)
+            {
+                var handle = new Rectangle
+                {
+                    Width = 8,
+                    Height = 8,
+                    Fill = Brushes.White,
+                    Stroke = Brushes.Black,
+                    StrokeThickness = 1,
+                    Cursor = GetResizeCursor(i)
+                };
+
+                PositionResizeHandle(handle, bounds, i);
+
+                handle.MouseDown += ResizeHandle_MouseDown;
+                handle.MouseMove += ResizeHandle_MouseMove;
+                handle.MouseUp += ResizeHandle_MouseUp;
+
+                resizeHandles.Add(handle);
+                mainCanvas.Children.Add(handle);
+            }
+        }
+        private void ResizeHandle_MouseMove(object sender, MouseEventArgs e)
+        {
+            if (isScaling && e.LeftButton == MouseButtonState.Pressed)
+            {
+                var position = e.GetPosition(mainCanvas);
+                
+                ScaleShape(position);
+                e.Handled = true;
+            }
         }
 
-        private void Shape_MouseUp(object sender, MouseButtonEventArgs e)
+        private void ResizeHandle_MouseUp(object sender, MouseButtonEventArgs e)
         {
-            if (isMoving)
+            if (isScaling)
             {
-                isMoving = false;
+                isScaling = false;
                 if (selectedShape != null)
                 {
-                    SaveAction("Move", selectedShape);
+                    SaveFinalPosition("Scale", selectedShape);
+                }
+                e.Handled = true;
+            }
+        }
+
+        private void HideResizeHandles()
+        {
+            foreach (var handle in resizeHandles)
+            {
+                mainCanvas.Children.Remove(handle);
+            }
+            resizeHandles.Clear();
+        }
+
+        private Cursor GetResizeCursor(int handleIndex)
+        {
+            switch (handleIndex)
+            {
+                case 0: return Cursors.SizeNWSE;
+                case 1: return Cursors.SizeNS;
+                case 2: return Cursors.SizeNESW;
+                case 3: return Cursors.SizeWE;
+                case 4: return Cursors.SizeNWSE;
+                case 5: return Cursors.SizeNS;
+                case 6: return Cursors.SizeNESW;
+                case 7: return Cursors.SizeWE;
+                default: return Cursors.Arrow;
+            }
+        }
+
+        private void PositionResizeHandle(Rectangle handle, Rect bounds, int index)
+        {
+            double x = 0, y = 0;
+
+            switch (index)
+            {
+                case 0: x = bounds.Left - 4; y = bounds.Top - 4; break;
+                case 1: x = bounds.Left + bounds.Width / 2 - 4; y = bounds.Top - 4; break;
+                case 2: x = bounds.Right - 4; y = bounds.Top - 4; break;
+                case 3: x = bounds.Right - 4; y = bounds.Top + bounds.Height / 2 - 4; break;
+                case 4: x = bounds.Right - 4; y = bounds.Bottom - 4; break;
+                case 5: x = bounds.Left + bounds.Width / 2 - 4; y = bounds.Bottom - 4; break;
+                case 6: x = bounds.Left - 4; y = bounds.Bottom - 4; break;
+                case 7: x = bounds.Left - 4; y = bounds.Top + bounds.Height / 2 - 4; break;
+            }
+
+            Canvas.SetLeft(handle, x);
+            Canvas.SetTop(handle, y);
+        }
+
+        private Rect GetShapeBounds(Shape shape)
+        {
+            if (shape is Rectangle rect)
+            {
+                double left = Canvas.GetLeft(rect);
+                double top = Canvas.GetTop(rect);
+                return new Rect(left, top, rect.Width, rect.Height);
+            }
+            else if (shape is Ellipse ellipse)
+            {
+                double left = Canvas.GetLeft(ellipse);
+                double top = Canvas.GetTop(ellipse);
+                return new Rect(left, top, ellipse.Width, ellipse.Height);
+            }
+            else if (shape is Line line)
+            {
+                double minX = Math.Min(line.X1, line.X2);
+                double minY = Math.Min(line.Y1, line.Y2);
+                double width = Math.Abs(line.X2 - line.X1);
+                double height = Math.Abs(line.Y2 - line.Y1);
+                return new Rect(minX, minY, width, height);
+            }
+            else if (shape is Polygon polygon)
+            {
+                if (polygon.Points.Count == 0) return new Rect();
+
+                double minX = polygon.Points.Min(p => p.X);
+                double minY = polygon.Points.Min(p => p.Y);
+                double maxX = polygon.Points.Max(p => p.X);
+                double maxY = polygon.Points.Max(p => p.Y);
+                return new Rect(minX, minY, maxX - minX, maxY - minY);
+            }
+
+            return new Rect();
+        }
+
+        private void ResizeHandle_MouseDown(object sender, MouseButtonEventArgs e)
+        {
+            if (sender is Rectangle handle && resizeHandles.Contains(handle))
+            {
+                isScaling = true;
+                scaleStartPoint = e.GetPosition(mainCanvas);
+                SaveInitialPosition(selectedShape);
+                e.Handled = true;
+            }
+        }
+        private void ScaleShape(Point position)
+        {
+            if (selectedShape == null) return;
+
+            double deltaX = position.X - scaleStartPoint.X;
+            double deltaY = position.Y - scaleStartPoint.Y;
+
+            double scaleFactorX = 1.0 + deltaX / 100.0;
+            double scaleFactorY = 1.0 + deltaY / 100.0;
+
+            scaleFactorX = Math.Max(MIN_SCALE, Math.Min(MAX_SCALE, scaleFactorX));
+            scaleFactorY = Math.Max(MIN_SCALE, Math.Min(MAX_SCALE, scaleFactorY));
+
+            if (selectedShape is Rectangle rect)
+            {
+                double newWidth = Math.Max(10, rect.Width * scaleFactorX);
+                double newHeight = Math.Max(10, rect.Height * scaleFactorY);
+
+                rect.Width = newWidth;
+                rect.Height = newHeight;
+            }
+            else if (selectedShape is Ellipse ellipse)
+            {
+                double newWidth = Math.Max(10, ellipse.Width * scaleFactorX);
+                double newHeight = Math.Max(10, ellipse.Height * scaleFactorY);
+
+                ellipse.Width = newWidth;
+                ellipse.Height = newHeight;
+            }
+            else if (selectedShape is Line line)
+            {
+                line.X2 = line.X1 + (line.X2 - line.X1) * scaleFactorX;
+                line.Y2 = line.Y1 + (line.Y2 - line.Y1) * scaleFactorY;
+            }
+            else if (selectedShape is Polygon polygon)
+            {
+                ScalePolygon(polygon, scaleFactorX, scaleFactorY);
+            }
+
+            ShowResizeHandles(selectedShape);
+            scaleStartPoint = position;
+        }
+
+        private void ScalePolygon(Polygon polygon, double scaleX, double scaleY)
+        {
+            if (polygon.Points.Count == 0) return;
+
+            double centerX = polygon.Points.Average(p => p.X);
+            double centerY = polygon.Points.Average(p => p.Y);
+
+            var newPoints = new PointCollection();
+            foreach (Point point in polygon.Points)
+            {
+                double newX = centerX + (point.X - centerX) * scaleX;
+                double newY = centerY + (point.Y - centerY) * scaleY;
+                newPoints.Add(new Point(newX, newY));
+            }
+            polygon.Points = newPoints;
+        }
+
+        private void MoveShape(Point position)
+        {
+            double deltaX = position.X - moveStartPoint.X;
+            double deltaY = position.Y - moveStartPoint.Y;
+
+            if (selectedShape is Line line)
+            {
+                line.X1 += deltaX;
+                line.Y1 += deltaY;
+                line.X2 += deltaX;
+                line.Y2 += deltaY;
+            }
+            else if (selectedShape is Polygon polygon)
+            {
+                var newPoints = new PointCollection();
+                foreach (Point point in polygon.Points)
+                {
+                    newPoints.Add(new Point(point.X + deltaX, point.Y + deltaY));
+                }
+                polygon.Points = newPoints;
+            }
+            else
+            {
+                double currentLeft = Canvas.GetLeft(selectedShape);
+                double currentTop = Canvas.GetTop(selectedShape);
+
+                if (!double.IsNaN(currentLeft) && !double.IsNaN(currentTop))
+                {
+                    Canvas.SetLeft(selectedShape, currentLeft + deltaX);
+                    Canvas.SetTop(selectedShape, currentTop + deltaY);
                 }
             }
+
+            if (resizeHandles.Count > 0)
+            {
+                ShowResizeHandles(selectedShape);
+            }
+
+            moveStartPoint = position;
         }
 
         #endregion
 
         #region Система отмены и действий
 
-        private void SaveAction(string type, Shape shape, object oldValue = null, object newValue = null, string property = null)
+        private void SaveInitialPosition(Shape shape)
         {
+            initialPosition = new ShapePosition();
+
+            if (shape is Line line)
+            {
+                initialPosition.X = Math.Min(line.X1, line.X2);
+                initialPosition.Y = Math.Min(line.Y1, line.Y2);
+                initialPosition.Width = Math.Abs(line.X2 - line.X1);
+                initialPosition.Height = Math.Abs(line.Y2 - line.Y1);
+            }
+            else if (shape is Polygon polygon)
+            {
+                initialPosition.Points = new List<Point>(polygon.Points);
+                var bounds = GetShapeBounds(polygon);
+                initialPosition.X = bounds.X;
+                initialPosition.Y = bounds.Y;
+                initialPosition.Width = bounds.Width;
+                initialPosition.Height = bounds.Height;
+            }
+            else
+            {
+                initialPosition.X = Canvas.GetLeft(shape);
+                initialPosition.Y = Canvas.GetTop(shape);
+                initialPosition.Width = shape.Width;
+                initialPosition.Height = shape.Height;
+            }
+        }
+
+        private void SaveFinalPosition(string actionType, Shape shape)
+        {
+            var finalPosition = new ShapePosition();
+
+            if (shape is Line line)
+            {
+                finalPosition.X = line.X1;
+                finalPosition.Y = line.Y1;
+                finalPosition.Width = line.X2 - line.X1;
+                finalPosition.Height = line.Y2 - line.Y1;
+            }
+            else if (shape is Polygon polygon)
+            {
+                finalPosition.Points = new List<Point>(polygon.Points);
+            }
+            else
+            {
+                finalPosition.X = Canvas.GetLeft(shape);
+                finalPosition.Y = Canvas.GetTop(shape);
+                finalPosition.Width = shape.Width;
+                finalPosition.Height = shape.Height;
+            }
+
+            SaveAction(actionType, shape, initialPosition, finalPosition, "Position");
+        }
+
+        private ShapePosition GetFullShapeState(Shape shape)
+        {
+            var state = new ShapePosition();
+
+            if (shape is Rectangle rect)
+            {
+                state.X = Canvas.GetLeft(rect);
+                state.Y = Canvas.GetTop(rect);
+                state.Width = rect.Width;
+                state.Height = rect.Height;
+            }
+            else if (shape is Ellipse ellipse)
+            {
+                state.X = Canvas.GetLeft(ellipse);
+                state.Y = Canvas.GetTop(ellipse);
+                state.Width = ellipse.Width;
+                state.Height = ellipse.Height;
+            }
+            else if (shape is Line line)
+            {
+                state.X = line.X1;
+                state.Y = line.Y1;
+                state.Width = line.X2 - line.X1;
+                state.Height = line.Y2 - line.Y1;
+            }
+            else if (shape is Polygon polygon)
+            {
+                state.Points = new List<Point>(polygon.Points);
+
+                if (polygon.Points.Count > 0)
+                {
+                    state.X = polygon.Points[0].X;
+                    state.Y = polygon.Points[0].Y;
+                    state.Width = polygon.Points.Max(p => p.X) - polygon.Points.Min(p => p.X);
+                    state.Height = polygon.Points.Max(p => p.Y) - polygon.Points.Min(p => p.Y);
+                }
+            }
+
+            return state;
+        }
+
+        private void SaveAction(string type, Shape shape, object oldValue = null, object newValue = null, string property = null, ShapePosition fullState = null)
+        {
+            if (shape == null)
+            {
+                Debug.WriteLine("❌ СОХРАНЕНИЕ ОШИБКИ: shape is NULL!");
+                return;
+            }
+            if (type != "Delete" && !mainCanvas.Children.Contains(shape))
+            {
+                Debug.WriteLine($"❌ СОХРАНЕНИЕ ОШИБКИ: фигура {shape.GetType().Name} не на холсте!");
+                return;
+            }
+
             var action = new EditorAction
             {
                 Type = type,
                 TargetShape = shape,
                 OldValue = oldValue,
                 NewValue = newValue,
-                PropertyName = property
+                PropertyName = property,
+                FullState = fullState
             };
 
-            undoStack.Push(action);
-
-            if (undoStack.Count > MAX_UNDO_STEPS)
+            if (undoQueue.Count >= MAX_UNDO_STEPS) 
             {
-                var array = undoStack.ToArray();
-                undoStack.Clear();
-                for (int i = 0; i < MAX_UNDO_STEPS; i++)
-                {
-                    undoStack.Push(array[i]);
-                }
+                var removedAction = undoQueue.Dequeue();
             }
+            undoQueue.Enqueue(action);
+
         }
 
         private void UndoButton_Click(object sender, RoutedEventArgs e)
         {
-            if (undoStack.Count == 0)
+            if (undoQueue.Count == 0)
             {
+                MessageBox.Show("Нет действий для отмены");
                 return;
             }
 
-            var lastAction = undoStack.Pop();
+            var lastAction = undoQueue.Last();
+            var actionsList = undoQueue.ToList();
+            actionsList.RemoveAt(actionsList.Count - 1);
+            undoQueue = new Queue<EditorAction>(actionsList);
 
-            switch (lastAction.Type)
+            if (lastAction.TargetShape == null)
             {
-                case "Create":
-                    mainCanvas.Children.Remove(lastAction.TargetShape);
-                    if (selectedShape == lastAction.TargetShape) DeselectShape();
-                    break;
-
-                case "ModifyColor":
-                    if (lastAction.OldValue is Color oldColor)
-                    {
-                        lastAction.TargetShape.Fill = new SolidColorBrush(oldColor);
-                        fillColor = oldColor;
-                        UpdateColorButtons();
-                    }
-                    break;
-
-                case "ModifyStroke":
-                    if (lastAction.OldValue is Color oldStrokeColor)
-                    {
-                        lastAction.TargetShape.Stroke = new SolidColorBrush(oldStrokeColor);
-                        strokeColor = oldStrokeColor;
-                        UpdateColorButtons();
-                    }
-                    break;
-
-                case "Delete":
-                    mainCanvas.Children.Add(lastAction.TargetShape);
-                    SelectShape(lastAction.TargetShape);
-                    break;
-
-                case "Move":
-                    DeselectShape();
-                    break;
+                Debug.WriteLine("❌ ОТМЕНА ОШИБКИ: TargetShape is NULL!");
+                return;
             }
+
+            if (lastAction.Type != "Create" && lastAction.Type != "Delete" &&
+                !mainCanvas.Children.Contains(lastAction.TargetShape))
+            {
+                Debug.WriteLine($"❌ ОТМЕНА ОШИБКИ: фигура не на холсте (тип действия: {lastAction.Type})");
+                return;
+            }
+
+            try
+            {
+                switch (lastAction.Type)
+                {
+                    case "Create":
+                        Debug.WriteLine($"🗑️ УДАЛЕНИЕ ФИГУРЫ: {lastAction.TargetShape.GetType().Name}");
+                        if (mainCanvas.Children.Contains(lastAction.TargetShape))
+                        {
+                            mainCanvas.Children.Remove(lastAction.TargetShape);
+                            if (selectedShape == lastAction.TargetShape) DeselectShape();
+                        }
+                        break;
+
+                    case "Delete":
+                        Debug.WriteLine($"↶ ВОССТАНОВЛЕНИЕ ФИГУРЫ: {lastAction.TargetShape.GetType().Name}");
+                        if (!mainCanvas.Children.Contains(lastAction.TargetShape))
+                        {
+                            if (lastAction.FullState != null)
+                            {
+                                RestoreFullShape(lastAction.TargetShape, lastAction.FullState);
+                            }
+                            mainCanvas.Children.Add(lastAction.TargetShape);
+                            SelectShape(lastAction.TargetShape);
+                        }
+                        break;
+
+                    case "Move":
+                    case "Scale":
+                        if (lastAction.OldValue is ShapePosition oldPos)
+                        {
+                            Debug.WriteLine($"↶ ВОССТАНОВЛЕНИЕ ПОЗИЦИИ: {lastAction.TargetShape.GetType().Name}");
+                            RestorePosition(lastAction.TargetShape, oldPos);
+                            if (selectedShape == lastAction.TargetShape)
+                            {
+                                ShowResizeHandles(lastAction.TargetShape);
+                            }
+                        }
+                        break;
+
+                    case "ModifyColor":
+                        if (lastAction.OldValue is Color oldColor)
+                        {
+                            Debug.WriteLine($"↶ ВОССТАНОВЛЕНИЕ ЦВЕТА: {oldColor} для {lastAction.TargetShape.GetType().Name}");
+                            lastAction.TargetShape.Fill = new SolidColorBrush(oldColor);
+                            UpdateColorButtons();
+                        }
+                        break;
+
+                    case "ModifyStroke":
+                        if (lastAction.OldValue is Color oldStrokeColor)
+                        {
+                            Debug.WriteLine($"↶ ВОССТАНОВЛЕНИЕ ОБВОДКИ: {oldStrokeColor} для {lastAction.TargetShape.GetType().Name}");
+                            lastAction.TargetShape.Stroke = new SolidColorBrush(oldStrokeColor);
+                            UpdateColorButtons();
+                        }
+                        break;
+                }
+
+                Debug.WriteLine($"✅ ОТМЕНА УСПЕШНА: {lastAction.Type}");
+            }
+            catch (Exception ex)
+            {
+                Debug.WriteLine($"❌ ОШИБКА ПРИ ОТМЕНЕ: {ex.Message}");
+            }
+
         }
 
-        private void RestoreDeletedButton_Click(object sender, RoutedEventArgs e)
+        private void RestorePosition(Shape shape, ShapePosition position)
         {
-            if (deletedShapes.Count > 0)
+            if (shape is Line line)
             {
-                var restoredShape = deletedShapes.Pop();
-                mainCanvas.Children.Add(restoredShape);
-
-                // Восстанавливаем оригинальные свойства перед выделением
-                restoredShape.StrokeThickness = strokeThickness;
-                restoredShape.Stroke = new SolidColorBrush(strokeColor);
-
-                SelectShape(restoredShape);
-                SaveAction("Create", restoredShape);
+                line.X1 = position.X;
+                line.Y1 = position.Y;
+                line.X2 = position.X + position.Width;
+                line.Y2 = position.Y + position.Height;
+            }
+            else if (shape is Polygon polygon && position.Points != null)
+            {
+                polygon.Points = new PointCollection(position.Points);
+            }
+            else
+            {
+                Canvas.SetLeft(shape, position.X);
+                Canvas.SetTop(shape, position.Y);
+                shape.Width = position.Width;
+                shape.Height = position.Height;
+            }
+        }
+        private void RestoreFullShape(Shape shape, ShapePosition state)
+        {
+            if (shape is Rectangle rect)
+            {
+                Canvas.SetLeft(rect, state.X);
+                Canvas.SetTop(rect, state.Y);
+                rect.Width = state.Width;
+                rect.Height = state.Height;
+            }
+            else if (shape is Ellipse ellipse)
+            {
+                Canvas.SetLeft(ellipse, state.X);
+                Canvas.SetTop(ellipse, state.Y);
+                ellipse.Width = state.Width;
+                ellipse.Height = state.Height;
+            }
+            else if (shape is Line line)
+            {
+                line.X1 = state.X;
+                line.Y1 = state.Y;
+                line.X2 = state.X + state.Width;
+                line.Y2 = state.Y + state.Height;
+            }
+            else if (shape is Polygon polygon && state.Points != null)
+            {
+                polygon.Points = new PointCollection(state.Points);
             }
         }
 
@@ -708,76 +1136,6 @@ namespace VectorEditor
 
             foreach (var colorInfo in fillColors)
             {
-                // Создаем StackPanel с цветным прямоугольником и текстом
-                var stackPanel = new StackPanel
-                {
-                    Orientation = Orientation.Horizontal,
-                    Background = Brushes.White
-                };
-
-                // Цветной прямоугольник
-                var colorRect = new Border
-                {
-                    Width = 20,
-                    Height = 15,
-                    Background = new SolidColorBrush(colorInfo.Color),
-                    Margin = new Thickness(0, 0, 8, 0),
-                    BorderBrush = Brushes.Black,
-                    BorderThickness = new Thickness(1)
-                };
-
-                // Название цвета
-                var textBlock = new TextBlock
-                {
-                    Text = colorInfo.Name,
-                    Foreground = Brushes.Black,
-                    VerticalAlignment = VerticalAlignment.Center
-                };
-
-                stackPanel.Children.Add(colorRect);
-                stackPanel.Children.Add(textBlock);
-
-                var menuItem = new MenuItem
-                {
-                    Header = stackPanel, // Используем StackPanel как содержимое
-                    Background = Brushes.White
-                };
-
-                menuItem.Click += (s, args) =>
-                {
-                    if (currentMode == EditorMode.Editing && selectedShape != null)
-                    {
-                        if (selectedShape is Line)
-                        {
-                            return;
-                        }
-
-                        var oldColor = ((SolidColorBrush)selectedShape.Fill).Color;
-                        SaveAction("ModifyColor", selectedShape, oldColor, colorInfo.Color, "FillColor");
-                        selectedShape.Fill = new SolidColorBrush(colorInfo.Color);
-                    }
-                    else if (currentMode == EditorMode.Drawing)
-                    {
-                        fillColor = colorInfo.Color;
-                        UpdateColorButtons();
-                    }
-                };
-                contextMenu.Items.Add(menuItem);
-            }
-
-            contextMenu.PlacementTarget = fillColorButton;
-            contextMenu.IsOpen = true;
-        }
-
-        private void StrokeColorButton_Click(object sender, RoutedEventArgs e)
-        {
-            if (strokeColorButton == null) return;
-
-            var contextMenu = new ContextMenu();
-
-            foreach (var colorInfo in strokeColors)
-            {
-                // Создаем StackPanel с цветным прямоугольником и текстом
                 var stackPanel = new StackPanel
                 {
                     Orientation = Orientation.Horizontal,
@@ -814,13 +1172,98 @@ namespace VectorEditor
                 {
                     if (currentMode == EditorMode.Editing && selectedShape != null)
                     {
+                        if (selectedShape is Line)
+                        {
+                            return;
+                        }
+
+                        if (!mainCanvas.Children.Contains(selectedShape))
+                        {
+                            return;
+                        }
+
+                        Debug.WriteLine($"🎨 ИЗМЕНЕНИЕ ЦВЕТА: {selectedShape.GetType().Name}");
+
+                        var oldColor = ((SolidColorBrush)selectedShape.Fill).Color;
+                        SaveAction("ModifyColor", selectedShape, oldColor, colorInfo.Color, "FillColor");
+                        selectedShape.Fill = new SolidColorBrush(colorInfo.Color);
+
+                        Debug.WriteLine($"✅ ЦВЕТ ИЗМЕНЕН: {oldColor} -> {colorInfo.Color}");
+                    }
+                    else if (currentMode == EditorMode.Creating)
+                    {
+                        fillColor = colorInfo.Color;
+                        UpdateColorButtons();
+                    }
+                };
+                contextMenu.Items.Add(menuItem);
+            }
+
+            contextMenu.PlacementTarget = fillColorButton;
+            contextMenu.IsOpen = true;
+        }
+
+        private void StrokeColorButton_Click(object sender, RoutedEventArgs e)
+        {
+            if (strokeColorButton == null) return;
+
+            var contextMenu = new ContextMenu();
+
+            foreach (var colorInfo in strokeColors)
+            {
+                var stackPanel = new StackPanel
+                {
+                    Orientation = Orientation.Horizontal,
+                    Background = Brushes.White
+                };
+
+                var colorRect = new Border
+                {
+                    Width = 20,
+                    Height = 15,
+                    Background = new SolidColorBrush(colorInfo.Color),
+                    Margin = new Thickness(0, 0, 8, 0),
+                    BorderBrush = Brushes.Black,
+                    BorderThickness = new Thickness(1)
+                };
+
+                var textBlock = new TextBlock
+                {
+                    Text = colorInfo.Name,
+                    Foreground = Brushes.Black,
+                    VerticalAlignment = VerticalAlignment.Center
+                };
+
+                stackPanel.Children.Add(colorRect);
+                stackPanel.Children.Add(textBlock);
+
+                var menuItem = new MenuItem
+                {
+                    Header = stackPanel,
+                    Background = Brushes.White
+                };
+
+                menuItem.Click += (s, args) =>
+                {
+                    if (currentMode == EditorMode.Editing && selectedShape != null)
+                    {
+                        if (!mainCanvas.Children.Contains(selectedShape))
+                        {
+                            MessageBox.Show("Ошибка: выбранная фигура не найдена");
+                            return;
+                        }
+
+                        Debug.WriteLine($"🎨 ИЗМЕНЕНИЕ ОБВОДКИ: {selectedShape.GetType().Name}");
+
                         var oldColor = ((SolidColorBrush)selectedShape.Stroke).Color;
                         SaveAction("ModifyStroke", selectedShape, oldColor, colorInfo.Color, "StrokeColor");
                         selectedShape.Stroke = new SolidColorBrush(colorInfo.Color);
                         strokeColor = colorInfo.Color;
                         UpdateColorButtons();
+
+                        Debug.WriteLine($"✅ ОБВОДКА ИЗМЕНЕНА: {oldColor} -> {colorInfo.Color}");
                     }
-                    else if (currentMode == EditorMode.Drawing)
+                    else if (currentMode == EditorMode.Creating)
                     {
                         strokeColor = colorInfo.Color;
                         UpdateColorButtons();
@@ -837,12 +1280,14 @@ namespace VectorEditor
         {
             if (selectedShape != null && mainCanvas != null)
             {
-                SaveAction("Delete", selectedShape);
-                deletedShapes.Push(selectedShape);
-                if (deletedShapes.Count > 5) deletedShapes.Pop();
+                Debug.WriteLine($"🗑️ УДАЛЕНИЕ ФИГУРЫ: {selectedShape.GetType().Name}");
 
+                var fullState = GetFullShapeState(selectedShape);
+                SaveAction("Delete", selectedShape, null, null, null, fullState);
                 mainCanvas.Children.Remove(selectedShape);
                 DeselectShape();
+
+                Debug.WriteLine($"✅ ФИГУРА УДАЛЕНА");
             }
         }
 
@@ -874,7 +1319,6 @@ namespace VectorEditor
                         writer.WriteLine("<?xml version=\"1.0\" encoding=\"UTF-8\"?>");
                         writer.WriteLine($"<svg width=\"{mainCanvas.Width}\" height=\"{mainCanvas.Height}\" xmlns=\"http://www.w3.org/2000/svg\">");
 
-                        // ✅ Белый фон для SVG
                         writer.WriteLine("<rect width=\"100%\" height=\"100%\" fill=\"white\"/>");
 
                         int savedCount = 0;
@@ -892,8 +1336,6 @@ namespace VectorEditor
                         }
 
                         writer.WriteLine("</svg>");
-
-                        System.Diagnostics.Debug.WriteLine($"💾 Сохранено {savedCount} фигур");
                     }
 
                     MessageBox.Show("Файл успешно сохранен!");
@@ -977,7 +1419,7 @@ namespace VectorEditor
             }
             catch (Exception ex)
             {
-                System.Diagnostics.Debug.WriteLine($"❌ Ошибка конвертации фигуры: {ex.Message}");
+                Debug.WriteLine($"❌ Ошибка конвертации фигуры: {ex.Message}");
             }
 
             return "";
