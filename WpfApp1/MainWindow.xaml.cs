@@ -31,11 +31,13 @@ namespace VectorEditor
         private Point scaleStartPoint;
         private Shape selectedShape;
 
+        // переменные для цвета и обводки
         private Color fillColor = Colors.LightGray;
         private Color strokeColor = Colors.LightGray;
         private double strokeThickness = 2;
-
-        private Queue<EditorAction> undoQueue = new Queue<EditorAction>(); // очередь для отмены
+        
+        // очередь для отмены
+        private Queue<EditorAction> undoQueue = new Queue<EditorAction>();
         private const int MAX_UNDO_STEPS = 10; // последние 10 действий
 
         private List<Point> polygonPoints = new List<Point>();
@@ -43,20 +45,24 @@ namespace VectorEditor
 
         private bool wasActuallyMoved = false;
 
+        // маркеры масштабирования
         private List<Rectangle> resizeHandles = new List<Rectangle>();
         private ShapePosition initialPosition;
 
-        // Ограничения масштабирования
+        // базовый размер холста
+        private const double BASE_CANVAS_SIZE = 2000;
+
+        // ограничения масштабирования
         private const double MIN_SCALE = 0.3;
         private const double MAX_SCALE = 3.0;
 
-        // Размер маркеров относительно размера фигуры
+        // размер маркеров относительно размера фигуры
         private const double HANDLE_SIZE_RATIO = 0.1;
         private const double MIN_HANDLE_SIZE = 6;
         private const double MAX_HANDLE_SIZE = 12;
         private int activeHandleIndex = -1; // переменная для хранения активного маркера
 
-        // Предустановленные цвета
+        // предустановленные цвета
         private readonly (string Name, Color Color)[] fillColors = new[]
         {
             ("Белый", Colors.White),
@@ -118,10 +124,15 @@ namespace VectorEditor
         {
             InitializeComponent();
             this.Loaded += MainWindow_Loaded;
+            this.SizeChanged += MainWindow_SizeChanged;
         }
 
         #region Инициализация
 
+        private void MainWindow_SizeChanged(object sender, SizeChangedEventArgs e)
+        {
+            UpdateCanvasSize(zoomSlider?.Value ?? 1.0); // обновление размера холста при масштабировании
+        }
         private void MainWindow_Loaded(object sender, RoutedEventArgs e)
         {
             try
@@ -132,6 +143,7 @@ namespace VectorEditor
                     zoomText.Text = "100%";
 
                 UpdateColorButtons();
+                UpdateCanvasSize(1.0);
 
                 shapeComboBox.SelectionChanged += ShapeComboBox_SelectionChanged;
                 zoomSlider.ValueChanged += ZoomSlider_ValueChanged;
@@ -181,6 +193,10 @@ namespace VectorEditor
 
         private void DrawModeRadio_Checked(object sender, RoutedEventArgs e)
         {
+            if (isCreatingPolygon)
+            {
+                CancelPolygonCreation();
+            }
             currentMode = EditorMode.Creating;
             DeselectShape();
             UpdateColorButtons();
@@ -188,12 +204,21 @@ namespace VectorEditor
 
         private void EditModeRadio_Checked(object sender, RoutedEventArgs e)
         {
+            if (isCreatingPolygon)
+            {
+                CancelPolygonCreation();
+            }
             currentMode = EditorMode.Editing;
             UpdateColorButtons();
         }
 
         private void ShapeComboBox_SelectionChanged(object sender, SelectionChangedEventArgs e)
         {
+            if (isCreatingPolygon && shapeComboBox.SelectedIndex != 3) // 3 - индекс Polygon
+            {
+                CancelPolygonCreation();
+            }
+
             if (shapeComboBox.SelectedIndex == 0) currentTool = ToolMode.Rectangle;
             else if (shapeComboBox.SelectedIndex == 1) currentTool = ToolMode.Ellipse;
             else if (shapeComboBox.SelectedIndex == 2) currentTool = ToolMode.Line;
@@ -228,6 +253,16 @@ namespace VectorEditor
                 zoomText.Text = "100%";
         }
 
+        private void UpdateCanvasSize(double scale) // соответствие размера холста масштабированию
+        {
+            if (mainCanvas == null || scrollViewer == null) return;
+
+            double minWidth = scrollViewer.ViewportWidth / Math.Max(scale, 0.1);
+            double minHeight = scrollViewer.ViewportHeight / Math.Max(scale, 0.1);
+
+            mainCanvas.Width = Math.Max(BASE_CANVAS_SIZE, minWidth);
+            mainCanvas.Height = Math.Max(BASE_CANVAS_SIZE, minHeight);
+        }
         private void ZoomSlider_ValueChanged(object sender, RoutedEventArgs e)
         {
             if (zoomSlider == null) return;
@@ -240,6 +275,8 @@ namespace VectorEditor
             {
                 var transform = new ScaleTransform(scale, scale);
                 mainCanvas.LayoutTransform = transform;
+
+                UpdateCanvasSize(scale);
             }
         }
 
@@ -363,6 +400,11 @@ namespace VectorEditor
 
         private void StartCreatingShape(Point position)
         {
+            if (isCreatingPolygon)
+            {
+                CancelPolygonCreation();
+            }
+
             isCreating = true;
             startPoint = position;
 
@@ -525,6 +567,17 @@ namespace VectorEditor
             currentShape = null;
         }
 
+        private void CancelPolygonCreation()
+        {
+            if (isCreatingPolygon && currentShape != null)
+            {
+                mainCanvas.Children.Remove(currentShape);
+                isCreatingPolygon = false;
+                polygonPoints.Clear();
+                currentShape = null;
+            }
+        }
+
         private bool LinesIntersect(List<Point> points, Point newPoint)
         {
             if (points.Count < 2) return false;
@@ -618,9 +671,7 @@ namespace VectorEditor
             HideResizeHandles();
 
             Rect bounds = GetShapeBounds(shape);
-
-            // Вычисляем динамический размер маркера
-            double handleSize = CalculateHandleSize(bounds.Width, bounds.Height);
+            double handleSize = CalculateHandleSize(bounds.Width, bounds.Height); // динамический размер маркера
 
             for (int i = 0; i < 8; i++)
             {
@@ -656,7 +707,6 @@ namespace VectorEditor
             {
                 var handle = resizeHandles[i];
 
-                // обновление размера маркера
                 if (Math.Abs(handle.Width - handleSize) > 0.1)
                 {
                     handle.Width = handleSize;
@@ -690,12 +740,12 @@ namespace VectorEditor
             if (isScaling)
             {
                 isScaling = false;
-                activeHandleIndex = -1; // Сбрасываем активный маркер
+                activeHandleIndex = -1; // сброс активного маркера
                 if (selectedShape != null)
                 {
                     SaveFinalPosition("Scale", selectedShape);
                     
-                    UpdateResizeHandlesPosition(); //обновление маркеров при завершении
+                    UpdateResizeHandlesPosition(); // обновление маркеров при завершении
                 }
                 e.Handled = true;
             }
@@ -705,7 +755,7 @@ namespace VectorEditor
         {
             foreach (var handle in resizeHandles)
             {
-                mainCanvas.Children.Remove(handle); //удаление всех маркеров из визуального дерева
+                mainCanvas.Children.Remove(handle); // удаление всех маркеров из визуального дерева
             }
             resizeHandles.Clear();
         }
@@ -789,9 +839,7 @@ namespace VectorEditor
             {
                 isScaling = true;
                 scaleStartPoint = e.GetPosition(mainCanvas);
-
-                // Сохраняем индекс активного маркера в начале масштабирования
-                activeHandleIndex = GetActiveHandleIndex(scaleStartPoint);
+                activeHandleIndex = GetActiveHandleIndex(scaleStartPoint); // индекс активного маркера для масштабирования
 
                 SaveInitialPosition(selectedShape);
                 e.Handled = true;
@@ -830,8 +878,7 @@ namespace VectorEditor
             double newWidth = bounds.Width;
             double newHeight = bounds.Height;
 
-            // Используем сохраненный индекс активного маркера
-            switch (activeHandleIndex)
+            switch (activeHandleIndex) // использование сохранённого индекса маркера
             {
                 case 0: // Верхний левый
                     newLeft = bounds.Left + deltaX;
@@ -1098,6 +1145,12 @@ namespace VectorEditor
 
         private void UndoButton_Click(object sender, RoutedEventArgs e)
         {
+            if (isCreatingPolygon)
+            {
+                CancelPolygonCreation();
+                return;
+            }
+
             if (undoQueue.Count == 0)
             {
                 MessageBox.Show("Нет действий для отмены");

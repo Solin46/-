@@ -63,13 +63,13 @@
 
         <!-- Холст -->
         <ScrollViewer Grid.Row="1" x:Name="scrollViewer" HorizontalScrollBarVisibility="Auto" 
-                      VerticalScrollBarVisibility="Auto">
+              VerticalScrollBarVisibility="Auto" Background="White">
             <Canvas x:Name="mainCanvas" 
-                    MouseDown="MainCanvas_MouseDown"
-                    MouseMove="MainCanvas_MouseMove"
-                    MouseUp="MainCanvas_MouseUp"
-                    Width="2000" Height="2000">
-
+            MouseDown="MainCanvas_MouseDown"
+            MouseMove="MainCanvas_MouseMove"
+            MouseUp="MainCanvas_MouseUp"
+            HorizontalAlignment="Stretch"
+            VerticalAlignment="Stretch">
                 <!-- Сетка для визуального ориентирования -->
                 <Canvas.Background>
                     <DrawingBrush Viewport="0,0,20,20" ViewportUnits="Absolute" TileMode="Tile">
@@ -79,7 +79,7 @@
                                     <RectangleGeometry Rect="0,0,20,20"/>
                                 </GeometryDrawing.Geometry>
                                 <GeometryDrawing.Pen>
-                                    <Pen Brush="LightGray" Thickness="0.3"/>
+                                    <Pen Brush="LightGray" Thickness="0.4"/>
                                 </GeometryDrawing.Pen>
                             </GeometryDrawing>
                         </DrawingBrush.Drawing>
